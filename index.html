@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+  <meta charset="UTF-8" />
+  <!-- H5 视口：禁止用户缩放（避免小朋友误触放大），支持刘海屏安全区 -->
+  <meta name="viewport"
+    content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="theme-color" content="#ff9f45" />
+  <meta name="format-detection" content="telephone=no,email=no,address=no" />
+  <!-- iOS 添加到主屏后全屏显示 -->
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="apple-mobile-web-app-title" content="音标乐园" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <title>英语音标乐园 · 零基础小朋友学音标</title>
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+
+<body>
+  <!-- 顶部标题 -->
+  <header class="site-header">
+    <h1 class="site-title">
+      <span class="title-emoji" aria-hidden="true">🎈</span>
+      英语音标乐园
+    </h1>
+    <p class="site-subtitle">点一点，听一听，跟我一起读！</p>
+  </header>
+
+  <!-- 导航：切换五个学习模块 -->
+  <nav class="tabs" aria-label="学习模块">
+    <button class="tab is-active" data-panel="letters" type="button">
+      <span class="tab-icon" aria-hidden="true">🔤</span><span>26个字母</span>
+    </button>
+    <button class="tab" data-panel="vowels" type="button">
+      <span class="tab-icon" aria-hidden="true">🍎</span><span>元音音标</span>
+    </button>
+    <button class="tab" data-panel="consonants" type="button">
+      <span class="tab-icon" aria-hidden="true">🐯</span><span>辅音音标</span>
+    </button>
+    <button class="tab" data-panel="trace" type="button">
+      <span class="tab-icon" aria-hidden="true">✏️</span><span>描红写法</span>
+    </button>
+    <button class="tab" data-panel="game" type="button">
+      <span class="tab-icon" aria-hidden="true">🎮</span><span>听音小游戏</span>
+    </button>
+    <button class="tab" data-panel="song" type="button">
+      <span class="tab-icon" aria-hidden="true">🎵</span><span>字母歌</span>
+    </button>
+  </nav>
+
+  <!-- 语音不可用时的提示 -->
+  <p id="speech-warning" class="speech-warning" hidden>
+    😢 这个浏览器好像不会发声哦，请换成电脑上的 Chrome 或 Edge 浏览器试试看。
+  </p>
+
+  <main class="container">
+
+    <!-- ============ 模块一：26 个字母 ============ -->
+    <section class="panel is-active" id="panel-letters" aria-label="26个字母">
+      <div class="panel-head">
+        <h2 class="panel-title">🔤 26 个字母</h2>
+        <p class="panel-tip">点卡片听字母的名字，点小图标听例词。</p>
+      </div>
+      <div class="toolbar">
+        <button class="btn btn-primary" id="btn-read-alphabet" type="button">▶ 从 A 读到 Z</button>
+        <button class="btn" id="btn-stop-alphabet" type="button">⏸ 停一停</button>
+      </div>
+      <div class="card-grid" id="letters-grid"></div>
+    </section>
+
+    <!-- ============ 模块二：元音音标 ============ -->
+    <section class="panel" id="panel-vowels" aria-label="元音音标">
+      <div class="panel-head">
+        <h2 class="panel-title">🍎 元音音标（20 个）</h2>
+        <p class="panel-tip">元音要张开嘴巴大声唱出来，点卡片就能听例词。</p>
+      </div>
+      <div id="vowels-groups"></div>
+    </section>
+
+    <!-- ============ 模块三：辅音音标 ============ -->
+    <section class="panel" id="panel-consonants" aria-label="辅音音标">
+      <div class="panel-head">
+        <h2 class="panel-title">🐯 辅音音标（28 个）</h2>
+        <p class="panel-tip">辅音很短很轻，像小声说话，点卡片听例词。</p>
+      </div>
+      <div id="consonants-groups"></div>
+    </section>
+
+    <!-- ============ 模块四：描红写法 ============ -->
+    <section class="panel" id="panel-trace" aria-label="描红写法">
+      <div class="panel-head">
+        <h2 class="panel-title">✏️ 描红写法</h2>
+        <p class="panel-tip">先选一个要写的，再用手指或鼠标在四线三格里描一描。</p>
+      </div>
+
+      <div class="trace-picker">
+        <div class="picker-row">
+          <span class="picker-label">选内容：</span>
+          <div class="chip-row" id="trace-kind">
+            <button class="chip is-active" data-kind="letter" type="button">字母</button>
+            <button class="chip" data-kind="vowel" type="button">元音音标</button>
+            <button class="chip" data-kind="consonant" type="button">辅音音标</button>
+          </div>
+        </div>
+        <div class="chip-row chip-row-scroll" id="trace-items"></div>
+      </div>
+
+      <div class="trace-stage">
+        <div class="trace-info">
+          <div class="trace-symbol" id="trace-symbol">Aa</div>
+          <div class="trace-meta">
+            <p class="trace-name" id="trace-name">字母 A</p>
+            <p class="trace-stroke" id="trace-stroke"></p>
+            <button class="btn btn-primary" id="btn-trace-say" type="button">🔊 听读音</button>
+          </div>
+        </div>
+
+        <div class="canvas-wrap">
+          <canvas id="trace-canvas" width="900" height="300" aria-label="描红练习区"></canvas>
+        </div>
+
+        <div class="toolbar">
+          <button class="btn btn-primary" id="btn-trace-clear" type="button">🧽 擦干净</button>
+          <button class="btn" id="btn-trace-guide" type="button">👀 隐藏范例</button>
+          <label class="pen-picker">
+            画笔颜色：
+            <input type="color" id="trace-color" value="#e5484d" />
+          </label>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 模块五：听音小游戏 ============ -->
+    <section class="panel" id="panel-game" aria-label="听音小游戏">
+      <div class="panel-head">
+        <h2 class="panel-title">🎮 听音小游戏</h2>
+        <p class="panel-tip">听一听声音，选出正确的那一个！</p>
+      </div>
+
+      <div class="game-setup">
+        <span class="picker-label">玩什么：</span>
+        <div class="chip-row" id="game-mode">
+          <button class="chip is-active" data-mode="letter" type="button">听字母</button>
+          <button class="chip" data-mode="vowel" type="button">听元音</button>
+          <button class="chip" data-mode="consonant" type="button">听辅音</button>
+        </div>
+      </div>
+
+      <div class="score-board">
+        <span class="score-item">✅ 答对 <b id="score-right">0</b></span>
+        <span class="score-item">❌ 答错 <b id="score-wrong">0</b></span>
+        <button class="btn" id="btn-score-reset" type="button">重新开始</button>
+      </div>
+
+      <div class="game-stage">
+        <button class="btn btn-big" id="btn-game-play" type="button">🔊 再听一次</button>
+        <p class="game-question" id="game-question">点上面的喇叭，听听是哪一个？</p>
+        <div class="option-grid" id="game-options"></div>
+        <p class="game-feedback" id="game-feedback">&nbsp;</p>
+        <button class="btn btn-primary" id="btn-game-next" type="button" hidden>下一题 ➡</button>
+      </div>
+    </section>
+
+    <!-- ============ 模块六：字母歌视频 ============ -->
+    <section class="panel" id="panel-song" aria-label="字母歌">
+      <div class="panel-head">
+        <h2 class="panel-title">🎵 ABC 字母歌</h2>
+        <p class="panel-tip">跟着视频一起唱，A B C D E F G……</p>
+      </div>
+
+      <div class="video-wrap">
+        <video id="song-video" class="song-video" controls playsinline preload="metadata"
+          src="audio/songs/ABC_The_Alphabet_Song.mp4">
+          你的浏览器不支持视频播放，请换成 Chrome 或 Edge 浏览器试试看。
+        </video>
+      </div>
+
+      <div class="toolbar">
+        <button class="btn btn-primary" id="btn-song-play" type="button">▶ 播放 / 暂停</button>
+        <button class="btn" id="btn-song-restart" type="button">⏮ 从头再唱</button>
+        <label class="pen-picker">
+          唱慢一点：
+          <select id="song-rate">
+            <option value="0.75">0.75 倍</option>
+            <option value="1" selected>正常</option>
+            <option value="1.25">1.25 倍</option>
+          </select>
+        </label>
+      </div>
+    </section>
+
+  </main>
+
+  <footer class="site-footer">
+    <p>小朋友，每天读 5 分钟，嘴巴会越来越棒！🌟</p>
+  </footer>
+
+  <script src="js/data.js"></script>
+  <script src="js/app.js"></script>
+</body>
+
+</html>
