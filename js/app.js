@@ -48,9 +48,8 @@
   function speak(text, opt) {
     opt = opt || {};
     if (!synth) { if (opt.onend) opt.onend(); return; }
-    if (!opt.keepQueue) { speakQueue = []; queueRunning = false; }
-    stopAudio();   // 语音朗读和音素录音互斥，后触发的接管播放
-    synth.cancel();
+    // 后触发的播放接管声音通道：先把正在播和排队等着播的声音全部掐掉
+    stopAllAudio({ keepQueue: opt.keepQueue });
 
     const u = new SpeechSynthesisUtterance(text);
     u.lang = (enVoice && enVoice.lang) || 'en-US';
@@ -67,7 +66,7 @@
   function speakList(list, opt) {
     opt = opt || {};
     if (!synth || !list.length) return;
-    synth.cancel();
+    stopAllAudio();
     speakQueue = list.slice();
     queueRunning = true;
 
@@ -82,17 +81,17 @@
       speak(item, {
         rate: opt.rate || 0.8,
         keepQueue: true,
-        onend: () => setTimeout(next, opt.gap || 350)
+        onend: () => {
+          pendingTimers.push(setTimeout(next, opt.gap || 350));
+        }
       });
     }
     next();
   }
 
+  /** 一键静音：语音、录音、字母歌全部停下 */
   function stopSpeak() {
-    speakQueue = [];
-    queueRunning = false;
-    if (synth) synth.cancel();
-    stopAudio();
+    stopAllAudio();
   }
 
   /* ========================================================
@@ -144,8 +143,10 @@
 
   // 已创建过的音频对象，避免每次点击都重新加载。key 用文件相对路径。
   const audioCache = {};
-  let activeAudio = null;
+  // 播放批次号：每次开始新的播放都会 +1，旧批次的回调、定时器一律作废
   let audioRunId = 0;
+  // 当前批次里挂起的定时器（连播的段间隔、朗读间隔），停止时要一起清掉
+  let pendingTimers = [];
 
   function getAudio(src) {
     if (!audioCache[src]) {
@@ -156,13 +157,36 @@
     return audioCache[src];
   }
 
-  function stopAudio() {
-    audioRunId++;
-    if (activeAudio) {
-      activeAudio.pause();
-      activeAudio.currentTime = 0;
-      activeAudio = null;
-    }
+  /** 立刻掐掉一个 audio 元素：解绑回调、暂停、回到开头 */
+  function killAudio(a) {
+    a.onended = null;
+    a.onerror = null;
+    try { a.pause(); } catch (e) { /* 忽略 */ }
+    // 归零，下次播放从头开始（媒体还没就绪时 seek 会抛错，忽略即可）
+    try { if (a.currentTime) a.currentTime = 0; } catch (e) { /* 忽略 */ }
+  }
+
+  /**
+   * 停掉当前所有正在发声的东西：语音合成 + 全部录音 + 挂起的连播定时器 + 字母歌视频。
+   * 每次开始新的播放前都会先调用它，做到"后触发的立刻接管播放"。
+   * @param {object} opt { keepQueue: 保留连读队列（队列内部推进时用）,
+   *                       keepSong: 不暂停字母歌视频（视频自己开始播放时用） }
+   */
+  function stopAllAudio(opt) {
+    opt = opt || {};
+    audioRunId++;                       // 让所有旧回调、旧定时器失效
+
+    pendingTimers.forEach(clearTimeout);
+    pendingTimers = [];
+
+    if (!opt.keepQueue) { speakQueue = []; queueRunning = false; }
+    if (synth) synth.cancel();
+
+    // 遍历所有缓存过的录音，而不只是"当前那一条"：
+    // play() 是异步的，可能有刚发出播放请求、还没真正响起来的音频。
+    Object.keys(audioCache).forEach(src => killAudio(audioCache[src]));
+
+    if (!opt.keepSong) pauseSong();
   }
 
   /**
@@ -172,18 +196,21 @@
    */
   function playClips(clips, opt) {
     opt = opt || {};
-    stopSpeak();
-    const runId = audioRunId;
+    if (!clips || !clips.length) return;
+    stopAllAudio();               // 先掐掉正在播 / 没播完的一切
+    const runId = audioRunId;     // 记下本批次编号，之后每一步都要核对
 
     function playAt(i) {
-      if (runId !== audioRunId || i >= clips.length) { activeAudio = null; return; }
+      if (runId !== audioRunId || i >= clips.length) return;
       const audio = getAudio(clips[i]);
-      activeAudio = audio;
-      audio.currentTime = 0;
+      audio.onended = null;
+      audio.onerror = null;
+      try { audio.currentTime = 0; } catch (e) { /* 忽略 */ }
       if (opt.onEach) opt.onEach(i);
+
       const next = () => {
         if (runId !== audioRunId) return;
-        if (opt.gap) setTimeout(() => playAt(i + 1), opt.gap);
+        if (opt.gap) pendingTimers.push(setTimeout(() => playAt(i + 1), opt.gap));
         else playAt(i + 1);
       };
       audio.onended = next;
@@ -191,8 +218,14 @@
         console.warn('录音加载失败：' + clips[i]);
         next();
       };
+
       const p = audio.play();
-      if (p && p.catch) p.catch(() => { /* 需要用户先交互，再点一次即可 */ });
+      if (p && p.then) {
+        p.then(() => {
+          // play() 真正生效时如果已经被新的播放接管，立刻掐掉，避免残留声音
+          if (runId !== audioRunId) killAudio(audio);
+        }).catch(() => { /* 被接管，或需要用户先交互，再点一次即可 */ });
+      }
     }
     playAt(0);
   }
@@ -219,9 +252,8 @@
   const panels = Array.prototype.slice.call(document.querySelectorAll('.panel'));
 
   function showPanel(name) {
-    stopSpeak();
-    // 离开字母歌面板时把视频暂停，避免声音在后台继续播放
-    if (name !== 'song') pauseSong();
+    // 切换面板时把所有声音（朗读、录音、字母歌）都停掉，避免在后台继续播
+    stopAllAudio();
     tabs.forEach(t => t.classList.toggle('is-active', t.dataset.panel === name));
     panels.forEach(p => p.classList.toggle('is-active', p.id === 'panel-' + name));
     if (name === 'game' && !gameStarted) startGame();
@@ -830,9 +862,14 @@
    * ====================================================== */
   const songVideo = document.getElementById('song-video');
 
-  /** 暂停字母歌（切换面板 / 开始朗读时调用） */
+  /**
+   * 暂停字母歌（切换面板 / 播放别的音频时调用）
+   * 这里用 getElementById 现取元素：stopAllAudio 可能在本节的 songVideo
+   * 常量初始化之前就被调用，直接引用常量会踩到 const 的暂时性死区。
+   */
   function pauseSong() {
-    if (songVideo && !songVideo.paused) songVideo.pause();
+    const v = document.getElementById('song-video');
+    if (v && !v.paused) v.pause();
   }
 
   if (songVideo) {
@@ -841,7 +878,8 @@
     const songRateSel = document.getElementById('song-rate');
 
     // 视频开始播放时，把字母/音标录音和朗读都停掉，避免两个声音打架
-    songVideo.addEventListener('play', stopSpeak);
+    // keepSong: 别把刚刚开始播放的自己又暂停掉
+    songVideo.addEventListener('play', () => stopAllAudio({ keepSong: true }));
 
     songPlayBtn.addEventListener('click', () => {
       if (songVideo.paused) {
