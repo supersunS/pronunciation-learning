@@ -100,12 +100,14 @@
    * 浏览器语音引擎无法朗读 IPA 符号本身，所以音标一律播放本地音素录音。
    * 音源：audio/phonemes/（KK 美式音标音素录音，按音标重命名后存放）。
    *
-   * 三点说明：
+   * 四点说明：
    * 1. 大部分音标都有独立录音，点一下播一个文件，按录音原速播放。
    * 2. /eɪ/ /əʊ/ 和中央双元音 /ɪə/ /eə/ /ʊə/、以及 /tr/ /dr/ /ts/ /dz/
    *    没有独立录音，按组成音素依次连播。
    * 3. /ɒ/ 用 [ɑ] 的录音 —— 美音里 lot（/ɒ/）和 palm（/ɑː/）已合并成同一个音，
    *    KK 音标体系里没有单独的 /ɒ/。
+   * 4. 原始录音里同一个音连念了 2~3 遍（整条 1.8~5.4 秒），播放时只取
+   *    第一遍，见下面的"录音播放引擎"。
    * ====================================================== */
   const IPA_AUDIO_DIR = 'audio/phonemes/';
 
@@ -138,10 +140,180 @@
   };
 
   // 26 个字母名称的真人录音，文件名就是小写字母（audio/letters/a.mp3 …）
-  // 原文件是 2 秒、后段全是静音，已裁剪成 0.55~0.81 秒并统一峰值音量。
+  // 原始文件约 2 秒：前 0.6 秒是字母读音，后面全是静音。
   const LETTER_AUDIO_DIR = 'audio/letters/';
 
-  // 已创建过的音频对象，避免每次点击都重新加载。key 用文件相对路径。
+  /* ========================================================
+   * 录音播放引擎（Web Audio）
+   *
+   * 这里不用 <audio> 元素反复 pause / currentTime = 0 / play，原因有两个：
+   *
+   * 1. 录音素材本身是"同一个音连念 2~3 遍"，每遍之间还夹着约 0.9 秒静音，
+   *    整条 1.8~5.4 秒。点一下要等好几秒才播完，快速切换时上一条往往
+   *    停在第二遍或中间的静音上，听起来就是残缺的一截。
+   * 2. <audio> 元素是缓存复用的，pause() 之后把 currentTime 归零是一次
+   *    异步 seek。连点很快时 seek 还没落地 play() 就开始了，声音会从上次
+   *    的位置（也就是录音中间）接着响，同样是"只听到中间一小段"。
+   *
+   * 改成 Web Audio 后：每个文件只解码一次，顺手算出"第一遍发音"的区间，
+   * 播放时新建一个 source 只播这一段（0.5~1 秒，干净完整），
+   * 停止用 source.stop()，立刻断声、没有 seek 竞态。
+   * ====================================================== */
+  const AudioCtx = window.AudioContext || window.webkitAudioContext || null;
+  let audioCtx = null;
+  const clipCache = {};     // src -> { buffer, offset, duration }
+  const clipLoading = {};   // src -> Promise，避免同一个文件被并发加载两次
+  let liveSources = [];     // 当前正在发声的 source 节点
+
+  function getCtx() {
+    if (!AudioCtx) return null;
+    if (!audioCtx) audioCtx = new AudioCtx();
+    return audioCtx;
+  }
+
+  /** 在用户手势里调用，解除浏览器对音频的自动播放限制 */
+  function resumeCtx() {
+    const ctx = getCtx();
+    if (ctx && ctx.state === 'suspended' && ctx.resume) {
+      const p = ctx.resume();
+      if (p && p.catch) p.catch(() => { /* 忽略 */ });
+    }
+  }
+
+  /* ---- 有声段识别参数（按现有 50 条录音的电平包络标定过）----
+   * 用 10ms 窗的 RMS 判断有没有声音：RMS 比峰值稳，不会被衰减尾音
+   * 和低电平杂音骗过去，从而误把"第二遍"也算进来。 */
+  const SEG_WINDOW = 0.01;    // 10ms 一个分析窗
+  const SEG_GAP = 0.25;       // 连续安静超过这么久，就认为第一遍念完了
+  const SEG_HEAD_PAD = 0.03;  // 起点往前留一点，别把音头切掉
+  const SEG_TAIL_PAD = 0.10;  // 结尾多留一点，让尾音自然收住
+  const SEG_REL = 0.12;       // 安静判定阈值：整条最大 RMS 的 12%
+  const SEG_ABS = 0.0015;     // 同时不低于这个绝对底噪值
+  const SEG_MIN = 0.35;       // 最短播放时长：/p/ /t/ /k/ 这类爆破音本身极短
+  const SEG_MAX = 1.20;       // 最长播放时长：识别失败时的保险，别整条播完
+
+  /**
+   * 找出录音里"第一遍发音"的区间，把前后静音和后面重复的几遍都排除掉。
+   * @returns {{offset:number, duration:number}} 单位秒
+   */
+  function firstSoundSegment(buffer) {
+    const total = buffer.duration;
+    const chans = [];
+    for (let c = 0; c < buffer.numberOfChannels; c++) chans.push(buffer.getChannelData(c));
+    if (!chans.length) return { offset: 0, duration: total };
+
+    const len = chans[0].length;
+    const win = Math.max(1, Math.round(SEG_WINDOW * buffer.sampleRate));
+    const count = Math.ceil(len / win);
+    const rms = new Float32Array(count);
+    let max = 0;
+
+    for (let w = 0; w < count; w++) {
+      const from = w * win;
+      const to = Math.min(len, from + win);
+      let sum = 0;
+      for (let i = from; i < to; i++) {
+        let mix = 0;
+        for (let c = 0; c < chans.length; c++) mix += chans[c][i];
+        mix /= chans.length;
+        sum += mix * mix;
+      }
+      const v = Math.sqrt(sum / Math.max(1, to - from));
+      rms[w] = v;
+      if (v > max) max = v;
+    }
+
+    const gate = Math.max(max * SEG_REL, SEG_ABS);
+    let start = -1;
+    for (let w = 0; w < count; w++) {
+      if (rms[w] >= gate) { start = w; break; }
+    }
+    // 整条都没声音（或识别失败）就原样播放，宁可多播也不要没声音
+    if (start < 0) return { offset: 0, duration: total };
+
+    const gapWins = Math.max(1, Math.round(SEG_GAP / SEG_WINDOW));
+    let end = count;
+    let quiet = 0;
+    for (let w = start; w < count; w++) {
+      if (rms[w] < gate) {
+        quiet++;
+        if (quiet >= gapWins) { end = w - quiet + 1; break; }
+      } else {
+        quiet = 0;
+      }
+    }
+    if (end <= start) end = count;
+
+    const offset = Math.max(0, start * SEG_WINDOW - SEG_HEAD_PAD);
+    let duration = Math.min(total, end * SEG_WINDOW + SEG_TAIL_PAD) - offset;
+    if (duration < SEG_MIN) duration = Math.min(SEG_MIN, total - offset);
+    if (duration > SEG_MAX) duration = SEG_MAX;
+    return { offset: offset, duration: Math.max(0.05, duration) };
+  }
+
+  /** decodeAudioData 的新旧两种写法兼容（老 Safari 只有回调式） */
+  function decodeAudio(ctx, arrayBuffer) {
+    return new Promise((resolve, reject) => {
+      const p = ctx.decodeAudioData(arrayBuffer, resolve, reject);
+      if (p && p.then) p.then(resolve, reject);
+    });
+  }
+
+  /** 加载 + 解码 + 算出有声段，结果缓存起来，第二次点击就是即时的 */
+  function loadClip(src) {
+    if (clipCache[src]) return Promise.resolve(clipCache[src]);
+    if (clipLoading[src]) return clipLoading[src];
+
+    const ctx = getCtx();
+    const task = fetch(src)
+      .then(res => {
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        return res.arrayBuffer();
+      })
+      .then(raw => decodeAudio(ctx, raw))
+      .then(buffer => {
+        const seg = firstSoundSegment(buffer);
+        const clip = { buffer: buffer, offset: seg.offset, duration: seg.duration };
+        clipCache[src] = clip;
+        delete clipLoading[src];
+        return clip;
+      })
+      .catch(err => {
+        delete clipLoading[src];
+        throw err;
+      });
+
+    clipLoading[src] = task;
+    return task;
+  }
+
+  /** 播放一个片段：每次都新建 source，从有声段开头播到结尾 */
+  function playSegment(clip, onEnded) {
+    const ctx = getCtx();
+    const source = ctx.createBufferSource();
+    source.buffer = clip.buffer;
+    source.connect(ctx.destination);
+    liveSources.push(source);
+    source.onended = () => {
+      const i = liveSources.indexOf(source);
+      if (i >= 0) liveSources.splice(i, 1);
+      if (onEnded) onEnded();
+    };
+    source.start(0, clip.offset, clip.duration);
+  }
+
+  /** 掐掉所有正在发声的 source */
+  function stopSources() {
+    const list = liveSources;
+    liveSources = [];
+    list.forEach(s => {
+      s.onended = null;
+      try { s.stop(); } catch (e) { /* 忽略：可能还没 start */ }
+      try { s.disconnect(); } catch (e) { /* 忽略 */ }
+    });
+  }
+
+  // 兜底路径（浏览器没有 Web Audio 时）用到的 <audio> 元素缓存
   const audioCache = {};
   // 播放批次号：每次开始新的播放都会 +1，旧批次的回调、定时器一律作废
   let audioRunId = 0;
@@ -182,15 +354,17 @@
     if (!opt.keepQueue) { speakQueue = []; queueRunning = false; }
     if (synth) synth.cancel();
 
-    // 遍历所有缓存过的录音，而不只是"当前那一条"：
-    // play() 是异步的，可能有刚发出播放请求、还没真正响起来的音频。
+    stopSources();   // Web Audio：停掉所有在响的片段
+
+    // 兜底路径的 <audio> 元素：遍历全部缓存，而不只是"当前那一条"，
+    // 因为 play() 是异步的，可能有刚发出请求、还没真正响起来的音频。
     Object.keys(audioCache).forEach(src => killAudio(audioCache[src]));
 
     if (!opt.keepSong) pauseSong();
   }
 
   /**
-   * 依次播放一串录音，按每段录音本身的时长自然衔接。
+   * 依次播放一串录音，每段只播"第一遍发音"，按有声段长度自然衔接。
    * @param {string[]} clips 音频文件路径
    * @param {object}   opt   { onEach(index), gap 段间隔毫秒（默认 0） }
    */
@@ -200,6 +374,40 @@
     stopAllAudio();               // 先掐掉正在播 / 没播完的一切
     const runId = audioRunId;     // 记下本批次编号，之后每一步都要核对
 
+    if (getCtx()) {
+      resumeCtx();                // 必须在点击这一帧的同步代码里调用
+      playClipsWebAudio(clips, opt, runId);
+    } else {
+      playClipsElement(clips, opt, runId);
+    }
+  }
+
+  /** Web Audio 版：主路径 */
+  function playClipsWebAudio(clips, opt, runId) {
+    function step(i) {
+      if (runId !== audioRunId) return;
+      if (opt.gap) pendingTimers.push(setTimeout(() => playAt(i + 1), opt.gap));
+      else playAt(i + 1);
+    }
+
+    function playAt(i) {
+      if (runId !== audioRunId || i >= clips.length) return;
+      loadClip(clips[i]).then(clip => {
+        // 加载 / 解码期间可能已经被新的播放接管，这时候就别再出声了
+        if (runId !== audioRunId) return;
+        if (opt.onEach) opt.onEach(i);
+        playSegment(clip, () => step(i));
+      }).catch(err => {
+        console.warn('录音加载失败：' + clips[i] + '（' + (err && err.message) + '）');
+        step(i);
+      });
+    }
+
+    playAt(0);
+  }
+
+  /** <audio> 元素版：只在浏览器不支持 Web Audio 时兜底 */
+  function playClipsElement(clips, opt, runId) {
     function playAt(i) {
       if (runId !== audioRunId || i >= clips.length) return;
       const audio = getAudio(clips[i]);
@@ -919,9 +1127,11 @@
   buildTraceChips();
   selectTrace(LETTERS[0]);
 
-  // 页面第一次被点击时"唤醒"语音引擎（部分浏览器要求用户先交互）
+  // 页面第一次被点击时"唤醒"语音引擎和录音播放引擎
+  // （部分浏览器要求用户先交互才允许出声）
   document.addEventListener('click', function warmUp() {
     if (synth) { pickVoice(); }
+    resumeCtx();
     document.removeEventListener('click', warmUp);
   }, { once: true });
 })();
